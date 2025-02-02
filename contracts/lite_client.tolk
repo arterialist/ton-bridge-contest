@@ -5,9 +5,11 @@ tolk 0.6
 const OP_NEW_KEY_BLOCK = 0x11a78ffe;
 const OP_CHECK_BLOCK = 0x8eaa9d76;
 
-fun isEpochValid(validatorsHash: int) {
+fun isEpochValid(validatorsHash: int, seqno: int) {
     var data = getContractData().beginParse();
-    return data.loadUint(256) == validatorsHash;
+    var hashesMatch = data.loadUint(256) == validatorsHash;
+    var seqnoBigger = seqno > data.loadUint(32);
+    return hashesMatch && seqnoBigger;
 }
 
 fun parseValidator(validator: slice) {
@@ -20,21 +22,21 @@ fun parseValidator(validator: slice) {
     return (nodeId, validatorPublicKey, validatorWeight);
 }
 
-fun isBlockSignatureValid(blockHash: int, validatorsDict: cell, signatures: cell) {
+fun isBlockSignatureValid(blockHash: int, validatorsDict: cell, maxMain: int, signatures: cell) {
     var signaturesSlice = signatures.beginParse();
     var blockFileHash = signaturesSlice.loadUint(256);
     var signaturesDict = signaturesSlice.loadDict();
     if (signaturesDict == null) { throw 0x00003001; }
 
     var message = beginCell().storeUint(0x70, 8).storeUint(0x6e, 8).storeUint(0x0b, 8).storeUint(0xc5, 8).storeUint(blockHash, 256).storeUint(blockFileHash, 256).endCell().beginParse();
-    var totalWeight = 0;
     var signedWeight = 0;
+    var validatorsDictByWeight = createEmptyDict();
     var (key, validator, found) = validatorsDict.uDictGetFirst(16);
     do {
             (key, validator, found) = validatorsDict.uDictGetNext(16, key);
-        if (found == -1) {            
+        if (found == -1) {           
             var (nodeId, validatorPublicKey, validatorWeight) = parseValidator(validator);
-            totalWeight += validatorWeight;
+            validatorsDictByWeight.uDictSet(64, validatorWeight, beginCell().storeUint(nodeId, 256).endCell().beginParse());
             var (signatureValue, signatureFound) = signaturesDict.uDictGet(256, nodeId);
             if (signatureFound == -1) {
                 var isValid = isSliceSignatureValid(message, signatureValue, validatorPublicKey);
@@ -43,6 +45,16 @@ fun isBlockSignatureValid(blockHash: int, validatorsDict: cell, signatures: cell
             }
         }
     } while (found != 0);
+
+    // count total weight of maxMain number of validators in validatorsDictByWeight
+    var totalWeight = 0;
+    var validatorsCount = 0;
+    var (valWeight, valNodeId, valFound) = validatorsDictByWeight.uDictGetFirst(64);
+    do {
+            (valWeight, valNodeId, valFound) = validatorsDictByWeight.uDictGetNext(64, valWeight);
+        totalWeight += valWeight;
+        validatorsCount += 1;
+    } while (validatorsCount < maxMain);
 
     return signedWeight * 3 > totalWeight * 2 ? -1 : 0;
 }
@@ -64,6 +76,16 @@ fun processNewKeyBlock(queryId: int, block: cell, signatures: cell, senderAddres
 
     var isKeyBlock = blockInfoSlice.loadBool();
     if (!isKeyBlock) { throw 0x00001002; }
+
+    blockInfoSlice.loadUint(1); // skip vertSeqnoIncr
+    blockInfoSlice.loadUint(8); // skip flags
+    var seqno = blockInfoSlice.loadUint(32); // skip seqNo
+    blockInfoSlice.loadUint(32); // skip vertSeqNo
+    blockInfoSlice.loadUint(2); // skip shardIdent
+    blockInfoSlice.loadUint(6); // skip shardPrefixBits
+    blockInfoSlice.loadInt(32); // skip workchainId
+    blockInfoSlice.loadUint(64); // skip shardId
+    var genUtime = blockInfoSlice.loadUint(32);
 
     blockSlice.loadRef(); // skip value_flow
     blockSlice.loadRef(); // skip state_update
@@ -98,33 +120,47 @@ fun processNewKeyBlock(queryId: int, block: cell, signatures: cell, senderAddres
     mcBlockExtraSlice.loadBits(256); // skip config_addr
 
     var config = mcBlockExtraSlice.loadRef();
+    var (currentValidatorsRaw, currentFound) = config.uDictGet(32, 0x22);
+    if (currentFound == 0) { throw 0x00001006; }
 
-    // get config param 0x20
-    var (blockValidatorsRaw, found) = config.uDictGet(32, 0x20);
-    if (found == 0) { throw 0x00001006; }
+    var currentValidators = currentValidatorsRaw.loadRef();
+    var currentValidatorsHash = currentValidators.cellHash();
 
-    var blockValidators = blockValidatorsRaw.loadRef();
-    var blockValidatorsHash = blockValidators.cellHash();
+    var data = getContractData().beginParse();
+    var validatorsHash = data.loadUint(256);
+    var storedSeqno = data.loadUint(32);
+    if (
+        validatorsHash != currentValidatorsHash ||
+        seqno < storedSeqno
+    ) { throw 0x00001007; }
+    
+    var (prevValidatorsRaw, prevFound) = config.uDictGet(32, 0x20);
+    if (prevFound == 0) { throw 0x00001008; }
 
-    if (!isEpochValid(blockValidatorsHash)) { throw 0x00001007; }
+    var prevValidators = prevValidatorsRaw.loadRef().beginParse();
+    var prevValidatorsType = prevValidators.loadUint(8);
+    prevValidators.loadUint(32); // skip utimeSince
+    var prevUtimeUntil = prevValidators.loadUint(32);
 
-    var blockValidatorsValue = blockValidators.beginParse();
-    var blockValidatorsType = blockValidatorsValue.loadUint(8);
-    var utimeSince = blockValidatorsValue.loadUint(32);
-    var utimeUntil = blockValidatorsValue.loadUint(32);
-    var total = blockValidatorsValue.loadUint(16);
-    var main = blockValidatorsValue.loadUint(16);
-
-    if (blockValidatorsType == 18) {
-        var totalWeight = blockValidatorsValue.loadUint(64);
+    if (genUtime < (prevUtimeUntil + 5000)) {
+        prevValidators.loadUint(16); // skip total
+        var prevMaxMain = prevValidators.loadUint(16);
+        if (prevValidatorsType == 18) { var totalWeight = prevValidators.loadUint(64); }
+        var validators = prevValidators.loadDict();
+        if (isBlockSignatureValid(block.cellHash(), validators, prevMaxMain, signatures) == 0) { throw 0x00001009; }
+    } else {
+        var currentValidatorsValue = currentValidators.beginParse();
+        var currentValidatorsType = currentValidatorsValue.loadUint(8);
+        currentValidatorsValue.loadUint(32); // skip utimeSince
+        currentValidatorsValue.loadUint(32); // skip utimeUntil
+        currentValidatorsValue.loadUint(16); // skip total
+        var currentMaxMain = currentValidatorsValue.loadUint(16);
+        if (currentValidatorsType == 18) { var totalWeight = currentValidatorsValue.loadUint(64); }
+        var validators = currentValidatorsValue.loadDict();
+        if (isBlockSignatureValid(block.cellHash(), validators, currentMaxMain, signatures) == 0) { throw 0x00001009; }
     }
 
-    var validators = blockValidatorsValue.loadDict();
-    if (validators == null) { throw 0x00001008; }
-
-    if (isBlockSignatureValid(block.cellHash(), validators, signatures) == 0) { throw 0x00001009; }
-
-    setContractData(beginCell().storeUint(blockValidatorsHash, 256).endCell());
+    setContractData(beginCell().storeUint(currentValidatorsHash, 256).storeUint(seqno, 32).endCell());
     sendRawMessage(
         beginCell()
             .storeUint(0x18, 6)
@@ -152,6 +188,16 @@ fun processCheckBlock(queryId: int, block: cell, signatures: cell, senderAddress
     blockInfoSlice.loadUint(32); // skip version
     blockInfoSlice.loadBits(6); // skip not_master, after_merge, before_split, after_split, want_split, want_merge
     blockInfoSlice.loadBool(); // skip key_block
+    blockInfoSlice.loadUint(1); // skip vertSeqnoIncr
+    blockInfoSlice.loadUint(8); // skip flags
+    var seqno = blockInfoSlice.loadUint(32);
+    blockInfoSlice.loadUint(32); // skip vertSeqNo
+    blockInfoSlice.loadUint(2); // skip shardIdent
+    blockInfoSlice.loadUint(6); // skip shardPrefixBits
+    blockInfoSlice.loadInt(32); // skip workchainId
+    blockInfoSlice.loadUint(64); // skip shardId
+    var genUtime = blockInfoSlice.loadUint(32);
+
     blockSlice.loadRef(); // skip value_flow
     blockSlice.loadRef(); // skip state_update
     var extra = blockSlice.loadRef();
@@ -181,31 +227,41 @@ fun processCheckBlock(queryId: int, block: cell, signatures: cell, senderAddress
     mcBlockExtraSlice.loadBits(256); // skip config_addr
 
     var config = mcBlockExtraSlice.loadRef();
+    var (currentValidatorsRaw, currentFound) = config.uDictGet(32, 0x22);
+    if (currentFound == 0) { throw 0x00002004; }
 
-    // get config param 0x20
-    var (blockValidatorsRaw, found) = config.uDictGet(32, 0x20);
-    if (found == 0) { throw 0x00002004; }
+    var currentValidators = currentValidatorsRaw.loadRef();
+    var currentValidatorsHash = currentValidators.cellHash();
 
-    var blockValidators = blockValidatorsRaw.loadRef();
-    var blockValidatorsHash = blockValidators.cellHash();
+    var data = getContractData().beginParse();
+    var validatorsHash = data.loadUint(256);
+    if (validatorsHash != currentValidatorsHash) { throw 0x00002005; }
 
-    if (!isEpochValid(blockValidatorsHash)) { throw 0x00002005; }
+    var (prevValidatorsRaw, prevFound) = config.uDictGet(32, 0x20);
+    if (prevFound == 0) { throw 0x00002006; }
 
-    var blockValidatorsValue = blockValidators.beginParse();
-    var blockValidatorsType = blockValidatorsValue.loadUint(8);
-    var utimeSince = blockValidatorsValue.loadUint(32);
-    var utimeUntil = blockValidatorsValue.loadUint(32);
-    var total = blockValidatorsValue.loadUint(16);
-    var main = blockValidatorsValue.loadUint(16);
+    var prevValidators = prevValidatorsRaw.loadRef().beginParse();
+    var prevValidatorsType = prevValidators.loadUint(8);
+    prevValidators.loadUint(32); // skip utimeSince
+    var prevUtimeUntil = prevValidators.loadUint(32);
 
-    if (blockValidatorsType == 18) {
-        var totalWeight = blockValidatorsValue.loadUint(64);
+    if (genUtime < (prevUtimeUntil + 5000)) {
+        prevValidators.loadUint(16); // skip total
+        var prevMaxMain = prevValidators.loadUint(16);
+        if (prevValidatorsType == 18) { var totalWeight = prevValidators.loadUint(64); }
+        var validators = prevValidators.loadDict();
+        if (isBlockSignatureValid(block.cellHash(), validators, prevMaxMain, signatures) == 0) { throw 0x00002007; }
+    } else {
+        var currentValidatorsValue = currentValidators.beginParse();
+        var currentValidatorsType = currentValidatorsValue.loadUint(8);
+        currentValidatorsValue.loadUint(32); // skip utimeSince
+        currentValidatorsValue.loadUint(32); // skip utimeUntil
+        currentValidatorsValue.loadUint(16); // skip total
+        var currentMaxMain = currentValidatorsValue.loadUint(16);
+        if (currentValidatorsType == 18) { var totalWeight = currentValidatorsValue.loadUint(64); }
+        var validators = currentValidatorsValue.loadDict();
+        if (isBlockSignatureValid(block.cellHash(), validators, currentMaxMain, signatures) == 0) { throw 0x00002007; }
     }
-
-    var validators = blockValidatorsValue.loadDict();
-    if (validators == null) { throw 0x00002006; }
-
-    if (isBlockSignatureValid(block.cellHash(), validators, signatures) == 0) { throw 0x00002007; }
 
     sendRawMessage(
         beginCell()

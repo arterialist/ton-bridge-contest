@@ -14,10 +14,14 @@ import { liteServer_BlockData } from "ton-lite-client/dist/schema";
 
 export type LiteClientConfig = {
   validators_hash: Buffer;
+  seqno: number;
 };
 
 export function liteClientConfigToCell(config: LiteClientConfig): Cell {
-  return beginCell().storeBuffer(config.validators_hash).endCell();
+  return beginCell()
+    .storeBuffer(config.validators_hash)
+    .storeUint(config.seqno, 32)
+    .endCell();
 }
 
 export class LiteClient implements Contract {
@@ -51,7 +55,7 @@ export class LiteClient implements Contract {
     signatures: Dictionary<Buffer, Buffer>
   ) {
     await provider.internal(via, {
-      value: toNano("0.05"),
+      value: toNano("0.1"),
       body: beginCell()
         .storeUint(0x11a78ffe, 32)
         .storeUint(0, 64)
@@ -73,7 +77,7 @@ export class LiteClient implements Contract {
     signatures: Dictionary<Buffer, Buffer>
   ) {
     await provider.internal(via, {
-      value: toNano("0.05"),
+      value: toNano("0.1"),
       body: beginCell()
         .storeUint(0x8eaa9d76, 32)
         .storeUint(0, 64)

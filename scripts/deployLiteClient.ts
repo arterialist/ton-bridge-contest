@@ -1,28 +1,27 @@
 import {
   Address,
-  beginCell,
   Builder,
   Cell,
   Dictionary,
-  DictionaryKey,
-  DictionaryKeyTypes,
   Slice,
   toNano,
 } from "@ton/core";
 import { LiteClient as LiteClientContract } from "../wrappers/LiteClient";
-import { compile, NetworkProvider, sleep } from "@ton/blueprint";
+import { compile, NetworkProvider } from "@ton/blueprint";
 import {
   LiteEngine,
   LiteSingleEngine,
   LiteRoundRobinEngine,
   LiteClient,
 } from "ton-lite-client";
-import { Functions, tonNode_blockIdExt } from "ton-lite-client/dist/schema";
+import {
+  Functions,
+  liteServer_BlockData,
+} from "ton-lite-client/dist/schema";
 import { TonClient } from "@ton/ton";
 import { sha256 } from "@ton/crypto";
 import { assert } from "node:console";
 import crypto from "crypto";
-import { createHash } from "node:crypto";
 
 const ENDPOINTS = {
   testnet: "https://testnet.toncenter.com/api/v2/",
@@ -146,7 +145,23 @@ async function parseValidators(validators: Cell) {
     });
   }
 
-  return parsedValidators;
+  console.log("active since", utimeSince, "until", utimeUntil);
+  console.log(
+    "validators active since",
+    new Date(utimeSince * 1000).toLocaleString(),
+    "until",
+    new Date(utimeUntil * 1000).toLocaleString()
+  );
+  console.log(
+    "are validators currently active",
+    new Date() > new Date(utimeSince * 1000) &&
+      new Date() < new Date(utimeUntil * 1000)
+  );
+  return {
+    validators: parsedValidators,
+    activeSince: utimeSince,
+    activeUntil: utimeUntil,
+  };
 }
 
 async function getValidatorsHash(network: Network) {
@@ -423,12 +438,26 @@ async function prepareNetworkInfo(network: Network) {
     Cell.fromBase64(lastFullKeyBlock.data.toString("base64"))
   );
   console.log("parsedKeyBlock", parsedKeyBlock);
-  const validatorsFromConfig = parsedKeyBlock.extra.mcBlockExtra
+  const prevValidatorsCell = parsedKeyBlock.extra.mcBlockExtra
     .configParams!.get(32)!
     .beginParse()
     .loadRef();
-  const validatorsHash = validatorsFromConfig?.hash();
-  const parsedValidators = await parseValidators(validatorsFromConfig!);
+  const {
+    validators: prevValidators,
+    activeSince: prevActiveSince,
+    activeUntil: prevActiveUntil,
+  } = await parseValidators(prevValidatorsCell!);
+
+  const curValidatorsCell = parsedKeyBlock.extra.mcBlockExtra
+    .configParams!.get(34)!
+    .beginParse()
+    .loadRef();
+  const { validators: curValidators } = await parseValidators(
+    curValidatorsCell!
+  );
+
+  let validatorsHash = curValidatorsCell!.hash();
+
   const blockSignatures = await getMasterchainBlockSignatures(
     network,
     parsedKeyBlock.blockInfo.seqNo
@@ -456,9 +485,16 @@ async function prepareNetworkInfo(network: Network) {
   }
   return {
     liteServerClient: { engine, client },
-    validators: { parsedValidators, validatorsHash },
+    validators: {
+      prevValidators: prevValidators,
+      currentValidators: curValidators,
+      currentValidatorsHash: validatorsHash,
+    },
     masterChainInfo,
-    lastFullKeyBlock,
+    lastFullKeyBlock: {
+      keyBlockData: lastFullKeyBlock,
+      parsedKeyBlock,
+    },
     signatures: {
       raw: signaturesRaw,
       dict: signaturesDict,
@@ -473,6 +509,55 @@ async function getWalletSeqno(address: string, network: Network) {
     "seqno"
   );
   return seqnoResult.stack.readNumber();
+}
+
+async function checkBlockSignature(
+  block: liteServer_BlockData,
+  validators: {
+    nodeId: Buffer;
+    nodeIdHex: string;
+    publicKey: Buffer;
+    weight: number;
+  }[],
+  signatures: { node_id: Buffer; node_id_short: string; signature: string }[]
+) {
+  const message = Buffer.concat([
+    Buffer.from([0x70, 0x6e, 0x0b, 0xc5]),
+    Cell.fromBase64(block.data.toString("base64")).hash(),
+    block.id.fileHash,
+  ]);
+
+  const sumLargestTotalWeights = validators
+    .sort((a, b) => Number(b.weight - a.weight))
+    .slice(0, 15)
+    .map((val) => val.weight)
+    .reduce((prev, cur) => prev + cur);
+
+  let totalWeight = 0;
+  for (const item of signatures) {
+    const validator = validators.find(
+      (val) => val.nodeIdHex === item.node_id_short
+    );
+    if (!validator) continue;
+
+    const key = pubkeyHexToEd25519DER(validator.publicKey.toString("hex"));
+    const verifyKey = crypto.createPublicKey({
+      format: "der",
+      type: "spki",
+      key,
+    });
+    const result = crypto.verify(
+      null,
+      message,
+      verifyKey,
+      Buffer.from(item.signature, "base64")
+    );
+    assert(result === true);
+    totalWeight += validator.weight;
+  }
+  console.log("Total weight:", totalWeight);
+  console.log("Sum of largest 100 validator weights:", sumLargestTotalWeights);
+  return totalWeight * 3 > sumLargestTotalWeights * 2;
 }
 
 export async function run(provider: NetworkProvider) {
@@ -498,96 +583,41 @@ export async function run(provider: NetworkProvider) {
   // console.log("Fastnet full block:", fastnetFullKeyBlock);
   // console.log("Fastnet signatures:", fastnetSignatures);
 
-  console.log("Testnet validators hash:", testnetValidators.validatorsHash);
-  console.log("Testnet validators:", testnetValidators.parsedValidators);
+  console.log(
+    "Testnet current validators hash:",
+    testnetValidators.currentValidatorsHash
+  );
+  console.log("Testnet previous validators:", testnetValidators.prevValidators);
+  console.log(
+    "Testnet current validators:",
+    testnetValidators.currentValidators
+  );
   console.log("Testnet masterchain info:", testnetMasterChainInfo);
-  console.log("Testnet full block:", testnetFullKeyBlock);
+  console.log("Testnet full block:", testnetFullKeyBlock.keyBlockData);
   console.log(
     "Testnet full block hash",
-    Cell.fromBase64(testnetFullKeyBlock.data.toString("base64"))
+    Cell.fromBase64(testnetFullKeyBlock.keyBlockData.data.toString("base64"))
       .hash()
       .toString("hex")
   );
   console.log("Testnet signatures raw:", testnetSignatures.raw);
   console.log("Testnet signatures dict:", testnetSignatures.dict);
 
-  const message = Buffer.concat([
-    Buffer.from([0x70, 0x6e, 0x0b, 0xc5]),
-    Cell.fromBase64(testnetFullKeyBlock.data.toString("base64")).hash(),
-    testnetFullKeyBlock.id.fileHash,
-  ]);
-
-  const messageCell = beginCell()
-    .storeUint(0x70, 8)
-    .storeUint(0x6e, 8)
-    .storeUint(0x0b, 8)
-    .storeUint(0xc5, 8)
-    .storeBuffer(
-      Cell.fromBase64(testnetFullKeyBlock.data.toString("base64")).hash()
-    )
-    .storeBuffer(testnetFullKeyBlock.id.fileHash)
-    .endCell();
-
-  // compare messageCell with message
-  console.log(
-    "messageCell",
-    messageCell
-      .beginParse()
-      .loadUintBig(256 + 256 + 8 + 8 + 8 + 8)
-      .toString(16)
+  const blockIsValid = await checkBlockSignature(
+    testnetFullKeyBlock.keyBlockData,
+    testnetValidators.prevValidators,
+    testnetSignatures.raw
   );
-  console.log("message", message.toString("hex"));
-
-  // calculate sha256 of messageCell
-  console.log("sha256 of messageCell", messageCell.hash().toString("hex"));
-  // calculate sha256 of messageCell content
-  console.log(
-    "sha256 of messageCell content",
-    createHash("sha256")
-      .update(
-        messageCell
-          .beginParse()
-          .loadUintBig(256 + 256 + 8 + 8 + 8 + 8)
-          .toString(16)
-      )
-      .digest("hex")
+  console.log("Block is valid with prev validators:", blockIsValid);
+  const blockIsValidWithCurrentValidators = await checkBlockSignature(
+    testnetFullKeyBlock.keyBlockData,
+    testnetValidators.currentValidators,
+    testnetSignatures.raw
   );
-
-  const sumLargestTotalWeights = testnetValidators.parsedValidators
-    .sort((a, b) => Number(b.weight - a.weight))
-    .slice(0, 100)
-    .map((val) => val.weight)
-    .reduce((prev, cur) => prev + cur);
-
-  let totalWeight = 0;
-  for (const item of testnetSignatures.raw) {
-    const validator = testnetValidators.parsedValidators.find(
-      (val) => val.nodeIdHex === item.node_id_short
-    );
-    if (!validator) continue;
-
-    console.log("validator", validator);
-    console.log("item", item);
-    console.log("message", message);
-
-    const key = pubkeyHexToEd25519DER(validator.publicKey.toString("hex"));
-    const verifyKey = crypto.createPublicKey({
-      format: "der",
-      type: "spki",
-      key,
-    });
-    const result = crypto.verify(
-      null,
-      message,
-      verifyKey,
-      Buffer.from(item.signature, "base64")
-    );
-    assert(result === true);
-    totalWeight += validator.weight;
-  }
-  console.log("Total weight:", totalWeight);
-  console.log("Sum of largest 100 validator weights:", sumLargestTotalWeights);
-  console.log("Block is valid:", totalWeight * 3 > sumLargestTotalWeights * 2);
+  console.log(
+    "Block is valid with current validators:",
+    blockIsValidWithCurrentValidators
+  );
 
   // console.log(
   //   "Testnet validators hash:",
@@ -607,7 +637,10 @@ export async function run(provider: NetworkProvider) {
 
   const testnetLiteClientContract = provider.open(
     LiteClientContract.createFromConfig(
-      { validators_hash: testnetValidators.validatorsHash },
+      {
+        validators_hash: testnetValidators.currentValidatorsHash,
+        seqno: testnetFullKeyBlock.parsedKeyBlock.blockInfo.prevSeqNo,
+      },
       await compile("LiteClient")
     )
   );
@@ -625,13 +658,13 @@ export async function run(provider: NetworkProvider) {
 
   await testnetLiteClientContract.sendNewKeyBlock(
     provider.sender(),
-    testnetFullKeyBlock,
+    testnetFullKeyBlock.keyBlockData,
     testnetSignatures.dict
   );
 
   await testnetLiteClientContract.sendCheckBlock(
     provider.sender(),
-    testnetFullKeyBlock,
+    testnetFullKeyBlock.keyBlockData,
     testnetSignatures.dict
   );
 
