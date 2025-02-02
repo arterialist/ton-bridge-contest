@@ -5,13 +5,6 @@ tolk 0.6
 const OP_NEW_KEY_BLOCK = 0x11a78ffe;
 const OP_CHECK_BLOCK = 0x8eaa9d76;
 
-fun isEpochValid(validatorsHash: int, seqno: int) {
-    var data = getContractData().beginParse();
-    var hashesMatch = data.loadUint(256) == validatorsHash;
-    var seqnoBigger = seqno > data.loadUint(32);
-    return hashesMatch && seqnoBigger;
-}
-
 fun parseValidator(validator: slice) {
     var validatorType = validator.loadUint(8); 
     validator.loadUint(32); // skip public key prefix
