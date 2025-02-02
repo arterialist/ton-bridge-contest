@@ -14,10 +14,7 @@ import {
   LiteRoundRobinEngine,
   LiteClient,
 } from "ton-lite-client";
-import {
-  Functions,
-  liteServer_BlockData,
-} from "ton-lite-client/dist/schema";
+import { Functions, liteServer_BlockData } from "ton-lite-client/dist/schema";
 import { TonClient } from "@ton/ton";
 import { sha256 } from "@ton/crypto";
 import { assert } from "node:console";
@@ -257,7 +254,11 @@ async function initLiteserver(network: Network) {
 }
 
 function parseBlock(block: Cell) {
-  const blockSlice = block.beginParse();
+  let blockSlice = block.beginParse(true);
+  if (block.isExotic) {
+    console.log("block is exotic");
+    blockSlice = blockSlice.loadRef().beginParse(true);
+  }
   const magicPrefix = blockSlice.loadUint(32);
   const globalId = blockSlice.loadInt(32);
 
@@ -282,7 +283,7 @@ function parseBlock(block: Cell) {
   // prev_vert_ref:vert_seqno_incr?^(BlkPrevInfo 0)
   // = BlockInfo;
 
-  const blockInfo = blockSlice.loadRef().beginParse();
+  const blockInfo = blockSlice.loadRef().beginParse(true);
   const magicPrefix2 = blockInfo.loadUint(32);
   const version = blockInfo.loadUint(32);
   const notMaster = blockInfo.loadUint(1);
@@ -313,42 +314,58 @@ function parseBlock(block: Cell) {
 
   const valueFlow = blockSlice.loadRef();
   const stateUpdate = blockSlice.loadRef();
-  const extra = blockSlice.loadRef().beginParse();
+  const extraRef = blockSlice.loadRef();
 
-  const magicPrefix3 = extra.loadUint(32);
-  const inMsgDescr = extra.loadRef();
-  const outMsgDescr = extra.loadRef();
-  const accountBlocks = extra.loadRef();
-  const randSeed = extra.loadBits(256);
-  const createdBy = extra.loadBits(256);
+  let magicPrefix3;
+  let inMsgDescr;
+  let outMsgDescr;
+  let accountBlocks;
+  let randSeed;
+  let createdBy;
 
-  const mcBlockExtra = extra.loadRef().beginParse();
-  const magicPrefix4 = mcBlockExtra.loadUint(16);
-  const isKeyBlock = mcBlockExtra.loadUint(1);
-
-  let shardHashes = mcBlockExtra.loadMaybeRef();
-  let shardFees = mcBlockExtra.loadMaybeRef();
+  let magicPrefix4;
+  let isKeyBlock;
+  let shardHashes;
+  let shardFees;
   let prevBlkSignatures;
   let recoverCreateMsg;
   let mintMsg;
-
   let configAddress;
   let configParams;
-  if (isKeyBlock) {
+
+  if (!block.isExotic) {
+    const extra = extraRef.beginParse(true);
+
+    magicPrefix3 = extra.loadUint(32);
+    console.log("magicPrefix3", magicPrefix3.toString(16));
+    inMsgDescr = extra.loadRef();
+    outMsgDescr = extra.loadRef();
+    accountBlocks = extra.loadRef();
+    randSeed = extra.loadBits(256);
+    createdBy = extra.loadBits(256);
+
+    const mcBlockExtra = extra.loadRef().beginParse(true);
+    magicPrefix4 = mcBlockExtra.loadUint(16);
+    isKeyBlock = mcBlockExtra.loadUint(1);
+
+    shardHashes = mcBlockExtra.loadMaybeRef();
+    shardFees = mcBlockExtra.loadMaybeRef();
     prevBlkSignatures = mcBlockExtra.loadMaybeRef();
     recoverCreateMsg = mcBlockExtra.loadMaybeRef();
     mintMsg = mcBlockExtra.loadMaybeRef();
-    configAddress = mcBlockExtra.loadBits(256);
-    configParams = mcBlockExtra
-      .loadRef()
-      .beginParse()
-      .loadDictDirect(Dictionary.Keys.Uint(32), {
-        serialize(src: Cell, builder: Builder) {},
-        parse(src: Slice): Cell {
-          return src.asCell();
-        },
-      });
-    console.log("configParams keys", configParams.keys());
+
+    if (isKeyBlock) {
+      configAddress = mcBlockExtra.loadBits(256);
+      configParams = mcBlockExtra
+        .loadRef()
+        .beginParse()
+        .loadDictDirect(Dictionary.Keys.Uint(32), {
+          serialize(src: Cell, builder: Builder) {},
+          parse(src: Slice): Cell {
+            return src.asCell();
+          },
+        });
+    }
   }
 
   return {
@@ -381,14 +398,14 @@ function parseBlock(block: Cell) {
       prevKeyBlockSeqno,
     },
     extra: {
-      magicPrefix3: magicPrefix3.toString(16),
-      inMsgDescr: inMsgDescr.toBoc().toString("base64"),
-      outMsgDescr: outMsgDescr.toBoc().toString("base64"),
-      accountBlocks: accountBlocks.toBoc().toString("base64"),
+      magicPrefix3: magicPrefix3?.toString(16),
+      inMsgDescr: inMsgDescr?.toBoc().toString("base64"),
+      outMsgDescr: outMsgDescr?.toBoc().toString("base64"),
+      accountBlocks: accountBlocks?.toBoc().toString("base64"),
       randSeed,
       createdBy,
       mcBlockExtra: {
-        magicPrefix4: magicPrefix4.toString(16),
+        magicPrefix4: magicPrefix4?.toString(16),
         isKeyBlock,
         shardHashes: shardHashes?.toBoc().toString("base64"),
         shardFees: shardFees?.toBoc().toString("base64"),
@@ -434,10 +451,33 @@ async function prepareNetworkInfo(network: Network) {
     Functions.liteServer_getBlock,
     blockInfo
   );
-  const parsedKeyBlock = parseBlock(
-    Cell.fromBase64(lastFullKeyBlock.data.toString("base64"))
+  const lastFullKeyBlockCell = Cell.fromBase64(
+    lastFullKeyBlock.data.toString("base64")
   );
+  const parsedKeyBlock = parseBlock(lastFullKeyBlockCell);
   console.log("parsedKeyBlock", parsedKeyBlock);
+
+  const lastFullKeyBlockHeader = await engine.query(
+    Functions.liteServer_getBlockHeader,
+    blockInfo
+  );
+  console.log("lastFullKeyBlockHeader", lastFullKeyBlockHeader);
+  const lastFullKeyBlockHeaderCell = Cell.fromBoc(
+    Buffer.from(lastFullKeyBlockHeader.headerProof.toString("hex"), "hex")
+  )[0];
+  console.log(
+    "proof hash",
+    lastFullKeyBlockHeaderCell
+      .beginParse(true)
+      .skip(8)
+      .loadBuffer(32)
+      .toString("hex")
+  );
+  console.log("root hash", lastFullKeyBlockHeader.id.rootHash.toString("hex"));
+  console.log("full block hash", lastFullKeyBlockCell.hash().toString("hex"));
+  const parsedLastFullKeyBlockHeader = parseBlock(lastFullKeyBlockHeaderCell);
+  console.log("parsedLastFullKeyBlockHeader", parsedLastFullKeyBlockHeader);
+
   const prevValidatorsCell = parsedKeyBlock.extra.mcBlockExtra
     .configParams!.get(32)!
     .beginParse()
