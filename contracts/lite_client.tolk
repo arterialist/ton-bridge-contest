@@ -274,13 +274,13 @@ fun onInternalMessage(myBalance: int, msgValue: int, msgFull: cell, msgBody: sli
     if (msgBody.isEndOfSlice()) { return; }
 
     var msgFullSlice = msgFull.beginParse();
-    msgFullSlice.loadUint(4); // skip flags
+    msgFullSlice.loadMessageFlags(); // skip flags
     var senderAddress = msgFullSlice.loadAddress();
 
-    var op = msgBody.loadUint(32);
-    if (op != OP_NEW_KEY_BLOCK && op != OP_CHECK_BLOCK) { throw 0x11111111; }
+    var op = msgBody.loadMessageOp();
+    if (op != OP_NEW_KEY_BLOCK && op != OP_CHECK_BLOCK) { throw 0xffff; }
 
-    var queryId = msgBody.loadUint(64);
+    var queryId = msgBody.loadMessageQueryId();
     var block: cell = msgBody.loadRef();
     var signatures: cell = msgBody.loadRef();
 
