@@ -1,11 +1,4 @@
-import {
-  Address,
-  Builder,
-  Cell,
-  Dictionary,
-  Slice,
-  toNano,
-} from "@ton/core";
+import { Address, Builder, Cell, Dictionary, Slice, toNano } from "@ton/core";
 import { LiteClient as LiteClientContract } from "../wrappers/LiteClient";
 import { compile, NetworkProvider } from "@ton/blueprint";
 import {
@@ -83,10 +76,6 @@ async function getLiteserversFromConfig(network: Network) {
 }
 
 async function parseValidators(validators: Cell) {
-  // validators#11 utime_since:uint32 utime_until:uint32
-  // total:(## 16) main:(## 16) { main <= total } { main >= 1 }
-  // list:(Hashmap 16 ValidatorDescr) = ValidatorSet;
-
   let slice = validators.beginParse();
   let type = slice.loadUint(8);
   let utimeSince = slice.loadUint(32); // utime_since
@@ -159,33 +148,6 @@ async function parseValidators(validators: Cell) {
     activeSince: utimeSince,
     activeUntil: utimeUntil,
   };
-}
-
-async function getValidatorsHash(network: Network) {
-  const endpoint = `${ENDPOINTS[network]}getConfigParam?config_id=34`;
-  console.log("Getting validators hash from", endpoint);
-  const validatorsConfig = await fetchWithRateLimit(endpoint).then((data) =>
-    data.json()
-  );
-  if (!validatorsConfig.ok)
-    throw new Error(`Failed to get config param 34 from ${endpoint}`);
-
-  const validators = Cell.fromBase64(validatorsConfig.result.config.bytes);
-  const parsedValidators = await parseValidators(validators);
-  return {
-    parsedValidators,
-    validatorsHash: validators.hash(),
-  };
-}
-
-async function getLastMasterchainBlock(network: Network) {
-  const endpoint = `${ENDPOINTS[network]}getMasterchainInfo`;
-  console.log("Getting last masterchain block from", endpoint);
-  const lastBlock = await fetchWithRateLimit(endpoint).then((data) =>
-    data.json()
-  );
-  if (!lastBlock.ok) throw new Error("Failed to get last masterchain block");
-  return lastBlock.result.last;
 }
 
 async function getMasterchainBlockSignatures(network: Network, seqno: number) {
@@ -421,7 +383,6 @@ function parseBlock(block: Cell) {
 async function prepareNetworkInfo(network: Network) {
   const { engine, client } = await initLiteserver(network);
   const masterChainInfo = await client.getMasterchainInfo();
-  // const { parsedValidators, validatorsHash } = await getValidatorsHash(network);
   const lastFullBlock = await engine.query(Functions.liteServer_getBlock, {
     kind: "liteServer.getBlock",
     id: {
@@ -443,8 +404,8 @@ async function prepareNetworkInfo(network: Network) {
       workchain: lastKeyBlock.workchain,
       shard: lastKeyBlock.shard,
       seqno: lastKeyBlock.seqno,
-      rootHash: lastKeyBlock.rootHash, // Replace with actual rootHash
-      fileHash: lastKeyBlock.fileHash, // Replace with actual fileHash
+      rootHash: lastKeyBlock.rootHash,
+      fileHash: lastKeyBlock.fileHash,
     },
   };
   const lastFullKeyBlock = await engine.query(
@@ -455,29 +416,6 @@ async function prepareNetworkInfo(network: Network) {
     lastFullKeyBlock.data.toString("base64")
   );
   const parsedKeyBlock = parseBlock(lastFullKeyBlockCell);
-  console.log("parsedKeyBlock", parsedKeyBlock);
-
-  const lastFullKeyBlockHeader = await engine.query(
-    Functions.liteServer_getBlockHeader,
-    blockInfo
-  );
-  console.log("lastFullKeyBlockHeader", lastFullKeyBlockHeader);
-  const lastFullKeyBlockHeaderCell = Cell.fromBoc(
-    Buffer.from(lastFullKeyBlockHeader.headerProof.toString("hex"), "hex")
-  )[0];
-  console.log(
-    "proof hash",
-    lastFullKeyBlockHeaderCell
-      .beginParse(true)
-      .skip(8)
-      .loadBuffer(32)
-      .toString("hex")
-  );
-  console.log("root hash", lastFullKeyBlockHeader.id.rootHash.toString("hex"));
-  console.log("full block hash", lastFullKeyBlockCell.hash().toString("hex"));
-  const parsedLastFullKeyBlockHeader = parseBlock(lastFullKeyBlockHeaderCell);
-  console.log("parsedLastFullKeyBlockHeader", parsedLastFullKeyBlockHeader);
-
   const prevValidatorsCell = parsedKeyBlock.extra.mcBlockExtra
     .configParams!.get(32)!
     .beginParse()
@@ -535,20 +473,12 @@ async function prepareNetworkInfo(network: Network) {
       keyBlockData: lastFullKeyBlock,
       parsedKeyBlock,
     },
+    invalidBlock: lastFullBlock,
     signatures: {
       raw: signaturesRaw,
       dict: signaturesDict,
     },
   };
-}
-
-async function getWalletSeqno(address: string, network: Network) {
-  const rpcClient = RPC_CLIENTS[network];
-  const seqnoResult = await rpcClient.runMethod(
-    Address.parse(address),
-    "seqno"
-  );
-  return seqnoResult.stack.readNumber();
 }
 
 async function checkBlockSignature(
@@ -601,27 +531,14 @@ async function checkBlockSignature(
 }
 
 export async function run(provider: NetworkProvider) {
-  // const {
-  //   liteServerClient: fastnetLiteServerClient,
-  //   validators: fastnetValidators,
-  //   masterChainInfo: fastnetMasterChainInfo,
-  //   lastFullKeyBlock: fastnetFullKeyBlock,
-  //   signatures: fastnetSignatures,
-  // } = await prepareNetworkInfo("fastnet");
-
   const {
     liteServerClient: testnetLiteServerClient,
     validators: testnetValidators,
     masterChainInfo: testnetMasterChainInfo,
     lastFullKeyBlock: testnetFullKeyBlock,
+    invalidBlock: testnetInvalidBlock,
     signatures: testnetSignatures,
   } = await prepareNetworkInfo("testnet");
-
-  // console.log("Fastnet validators hash:", fastnetValidators.validatorsHash);
-  // console.log("Fastnet validators:", fastnetValidators.parsedValidators);
-  // console.log("Fastnet masterchain info:", fastnetMasterChainInfo);
-  // console.log("Fastnet full block:", fastnetFullKeyBlock);
-  // console.log("Fastnet signatures:", fastnetSignatures);
 
   console.log(
     "Testnet current validators hash:",
@@ -659,22 +576,7 @@ export async function run(provider: NetworkProvider) {
     blockIsValidWithCurrentValidators
   );
 
-  // console.log(
-  //   "Testnet validators hash:",
-  //   testnetValidatorsHash.toString("hex")
-  // );
-  // console.log("Testnet masterchain info:", testnetMasterChainInfo);
-  // console.log("Testnet full block:", testnetFullKeyBlock);
-  // console.log("Testnet signatures:", testnetSignatures);
-
-  // console.log(
-  //   "Fastnet validators hash:",
-  //   fastnetValidatorsHash.toString("hex")
-  // );
-  // console.log("Fastnet masterchain info:", fastnetMasterChainInfo);
-  // console.log("Fastnet full block:", fastnetFullKeyBlock);
-  // console.log("Fastnet signatures:", fastnetSignatures);
-
+  // deploy lite client contract
   const testnetLiteClientContract = provider.open(
     LiteClientContract.createFromConfig(
       {
@@ -687,30 +589,31 @@ export async function run(provider: NetworkProvider) {
   await testnetLiteClientContract.sendDeploy(provider.sender(), toNano("0.01"));
   await provider.waitForDeploy(testnetLiteClientContract.address);
 
-  // const fastnetLiteClientContract = provider.open(
-  //   LiteClientContract.createFromConfig(
-  //     { validators_hash: testnetValidatorsHash },
-  //     await compile("LiteClient")
-  //   )
-  // );
-  // await fastnetLiteClientContract.sendDeploy(provider.sender(), toNano("0.01"));f
-  // await provider.waitForDeploy(fastnetLiteClientContract.address);
-
+  // send new valid key block
   await testnetLiteClientContract.sendNewKeyBlock(
     provider.sender(),
     testnetFullKeyBlock.keyBlockData,
     testnetSignatures.dict
   );
 
+  // send check block for valid block
   await testnetLiteClientContract.sendCheckBlock(
     provider.sender(),
     testnetFullKeyBlock.keyBlockData,
     testnetSignatures.dict
   );
 
-  // await fastnetLiteClientContract.sendNewKeyBlock(
-  //   provider.sender(),
-  //   testnetFullKeyBlock,
-  //   testnetSignatures
-  // );
+  // send check block for invalid block
+  await testnetLiteClientContract.sendNewKeyBlock(
+    provider.sender(),
+    testnetInvalidBlock,
+    testnetSignatures.dict
+  );
+
+  // send check block for invalid block
+  await testnetLiteClientContract.sendCheckBlock(
+    provider.sender(),
+    testnetInvalidBlock,
+    testnetSignatures.dict
+  );
 }
